@@ -1,23 +1,28 @@
 """
 WhatsApp-бот для автоматизации записи клиентов в баню.
-Библиотека: neonize (вход по QR-коду, сессия хранится в SQLite).
+Библиотека: neonize (вход по QR-коду).
+Хранение: Firebase Realtime Database (состояния клиентов и резервная копия сессии WhatsApp).
 Для Render: встроенный HTTP-сервер (health check и страница с QR-кодом /qr).
 
-Машина состояний (по JID клиента):
+Машина состояний (по номеру клиента):
     [нет состояния] --первое сообщение--> WAITING_FOR_DATA
     WAITING_FOR_DATA --данные заявки--> COMPLETED
     Любое состояние сбрасывается через SESSION_TIMEOUT секунд неактивности.
 """
 
+import base64
 import io
+import json
 import logging
 import os
+import sqlite3
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum, auto
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Any, Optional
 
 import qrcode
 from neonize.client import NewClient
@@ -29,7 +34,7 @@ from neonize.utils import build_jid
 # НАСТРОЙКИ
 # ============================================================================
 
-# Файл сессии WhatsApp. На Render без постоянного диска сбрасывается при деплое.
+# Файл сессии WhatsApp (локальная копия; при перезапуске восстанавливается из Firebase)
 SESSION_DB = os.environ.get("SESSION_DB", "db.sqlite3")
 
 # Порт, который выдаёт Render (локально по умолчанию 10000)
@@ -39,10 +44,21 @@ PORT = int(os.environ.get("PORT", "10000"))
 # Переменная окружения ADMIN_PHONE, если задана в Render, имеет приоритет.
 ADMIN_PHONE = os.environ.get("ADMIN_PHONE", "77787003325")
 
+# Firebase Realtime Database
+FIREBASE_URL = os.environ.get(
+    "FIREBASE_URL",
+    "https://jcord-f0102-default-rtdb.europe-west1.firebasedatabase.app",
+)
+# Корневой раздел в базе. Лучше задать длинное случайное имя через переменную окружения,
+# потому что без авторизации любой, кто знает URL и путь, сможет читать и писать данные.
+FIREBASE_PATH = os.environ.get("FIREBASE_PATH", "bath_bot")
+
 # Таймаут неактивности клиента, после которого состояние сбрасывается (секунды)
 SESSION_TIMEOUT = 30 * 60
-# Как часто фоновый поток очищает устаревшие состояния (секунды)
-CLEANUP_INTERVAL = 60
+# Как часто сохранять резервную копию сессии WhatsApp (секунды)
+SESSION_BACKUP_INTERVAL = 10 * 60
+# Через сколько секунд писать предупреждение, если QR-код так и не пришёл
+QR_WATCHDOG_DELAY = 60
 
 # Автоответ на первое сообщение клиента
 WELCOME_TEXT = (
@@ -86,7 +102,7 @@ ADMIN_NOTIFICATION_TEMPLATE = (
 
 
 # ============================================================================
-# ЛОГИРОВАНИЕ И КЛИЕНТ
+# ЛОГИРОВАНИЕ
 # ============================================================================
 
 logging.basicConfig(
@@ -95,15 +111,83 @@ logging.basicConfig(
 )
 log = logging.getLogger("bath_bot")
 
+
+# ============================================================================
+# FIREBASE REALTIME DATABASE (REST API)
+# ============================================================================
+
+def _fb_request(method: str, path: str, payload: Any = None) -> Any:
+    """Запрос к Firebase Realtime Database. Возвращает разобранный JSON или None."""
+    url = f"{FIREBASE_URL}/{FIREBASE_PATH}/{path}.json"
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw else None
+
+
+# ============================================================================
+# РЕЗЕРВНАЯ КОПИЯ СЕССИИ WHATSAPP
+# ============================================================================
+
+def _backup_session() -> None:
+    """Копирует файл сессии (через механизм backup SQLite) и сохраняет его в Firebase."""
+    if not os.path.exists(SESSION_DB):
+        return
+    tmp_path = SESSION_DB + ".bak"
+    try:
+        src = sqlite3.connect(SESSION_DB)
+        dst = sqlite3.connect(tmp_path)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        with open(tmp_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+        _fb_request("PUT", "wa_session", {"data": encoded, "saved_at": time.time()})
+        log.info("Сессия WhatsApp сохранена в Firebase")
+    except Exception:
+        log.exception("Не удалось сохранить сессию WhatsApp в Firebase")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+def _restore_session() -> None:
+    """Если локального файла сессии нет (например, после перезапуска Render), восстанавливает его."""
+    if os.path.exists(SESSION_DB):
+        log.info("Локальная сессия найдена, восстановление не нужно")
+        return
+    try:
+        stored = _fb_request("GET", "wa_session")
+    except Exception:
+        log.exception("Не удалось получить сессию из Firebase")
+        return
+    if not stored or "data" not in stored:
+        log.info("Сохранённой сессии в Firebase нет, потребуется сканирование QR-кода")
+        return
+    with open(SESSION_DB, "wb") as f:
+        f.write(base64.b64decode(stored["data"]))
+    log.info("Сессия WhatsApp восстановлена из Firebase")
+
+
+# Восстанавливаем сессию ДО создания клиента, иначе neonize откроет пустой файл
+_restore_session()
+
 client = NewClient(SESSION_DB)
 
 # Состояние для веб-страницы с QR-кодом
 _latest_qr: Optional[str] = None
 _connected = False
+_qr_received = False
 
 
 # ============================================================================
-# МАШИНА СОСТОЯНИЙ
+# МАШИНА СОСТОЯНИЙ (хранится в Firebase)
 # ============================================================================
 
 class State(Enum):
@@ -111,63 +195,45 @@ class State(Enum):
     COMPLETED = auto()
 
 
-@dataclass
-class UserSession:
-    state: State
-    last_active: float
-
-
-_sessions: dict[str, UserSession] = {}
-_sessions_lock = threading.Lock()
-
-
-def _get_state(jid: str) -> Optional[State]:
+def _get_state(key: str) -> Optional[State]:
     """Возвращает состояние клиента или None, если его нет или оно истекло."""
-    with _sessions_lock:
-        session = _sessions.get(jid)
-        if session is None:
-            return None
-        if time.time() - session.last_active > SESSION_TIMEOUT:
-            del _sessions[jid]
-            log.info("Состояние %s истекло по таймауту", jid)
-            return None
-        return session.state
+    try:
+        data = _fb_request("GET", f"sessions/{key}")
+    except Exception:
+        log.exception("Ошибка чтения состояния клиента %s", key)
+        return None
+    if not data:
+        return None
+    if time.time() - float(data.get("last_active", 0)) > SESSION_TIMEOUT:
+        _delete_state(key)
+        log.info("Состояние %s истекло по таймауту", key)
+        return None
+    try:
+        return State[data["state"]]
+    except KeyError:
+        return None
 
 
-def _set_state(jid: str, state: State) -> None:
-    with _sessions_lock:
-        _sessions[jid] = UserSession(state=state, last_active=time.time())
+def _set_state(key: str, state: State) -> None:
+    """Сохраняет состояние клиента и обновляет время последней активности."""
+    try:
+        _fb_request("PUT", f"sessions/{key}", {"state": state.name, "last_active": time.time()})
+    except Exception:
+        log.exception("Ошибка записи состояния клиента %s", key)
 
 
-def _touch(jid: str) -> None:
-    """Обновляет время последней активности клиента."""
-    with _sessions_lock:
-        session = _sessions.get(jid)
-        if session is not None:
-            session.last_active = time.time()
-
-
-def _cleanup_loop() -> None:
-    """Фоновый поток: периодически удаляет устаревшие состояния из памяти."""
-    while True:
-        time.sleep(CLEANUP_INTERVAL)
-        now = time.time()
-        with _sessions_lock:
-            expired = [
-                jid for jid, s in _sessions.items()
-                if now - s.last_active > SESSION_TIMEOUT
-            ]
-            for jid in expired:
-                del _sessions[jid]
-        if expired:
-            log.info("Очищено устаревших состояний: %d", len(expired))
+def _delete_state(key: str) -> None:
+    try:
+        _fb_request("DELETE", f"sessions/{key}")
+    except Exception:
+        log.exception("Ошибка удаления состояния клиента %s", key)
 
 
 # ============================================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ============================================================================
 
-def _send(jid, text: str) -> bool:
+def _send(jid: Any, text: str) -> bool:
     """Безопасная отправка сообщения. Возвращает True при успехе."""
     try:
         client.send_message(jid, text)
@@ -223,11 +289,28 @@ def _should_ignore(message: MessageEv) -> bool:
 # ОБРАБОТЧИКИ WHATSAPP
 # ============================================================================
 
+def _extract_qr_code(event: Any) -> Optional[str]:
+    """Пробует найти строку с QR-кодом в событии. Имя поля зависит от версии neonize."""
+    for name in ("Codes", "codes", "Code", "code", "QRCode", "qr_code"):
+        value = getattr(event, name, None)
+        if isinstance(value, (list, tuple)) and value:
+            return str(value[0])
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 @client.event(QREv)
 def on_qr(_: NewClient, event: QREv) -> None:
-    global _latest_qr
-    # Проверьте имя атрибута в документации вашей версии neonize
-    _latest_qr = event.Codes[0]
+    global _latest_qr, _qr_received
+    # Диагностика: пишем содержимое события, чтобы видеть реальные имена полей
+    log.info("Событие QR получено: %r", event)
+    code = _extract_qr_code(event)
+    if not code:
+        log.warning("В событии QR не найдено поле с кодом, см. строку выше")
+        return
+    _latest_qr = code
+    _qr_received = True
     log.info("Получен новый QR-код, откройте /qr в браузере")
 
 
@@ -237,6 +320,7 @@ def on_connected(_: NewClient, __: ConnectedEv) -> None:
     _connected = True
     _latest_qr = None
     log.info("Бот подключён к WhatsApp")
+    threading.Thread(target=_backup_session, daemon=True).start()
 
 
 @client.event(MessageEv)
@@ -246,32 +330,32 @@ def on_message(_: NewClient, message: MessageEv) -> None:
 
     src = message.Info.MessageSource
     chat = src.Chat
-    # Ключ состояния и адрес ответа: JID клиента в личном чате
-    jid_key = f"{chat.User}@{chat.Server}"
+    # Ключ в Firebase: только номер (в ключах RTDB нельзя использовать символ «@»)
+    key = chat.User
     client_phone = src.Sender.User
 
     text = _extract_text(message)
-    state = _get_state(jid_key)
+    state = _get_state(key)
 
     try:
         # Первое сообщение клиента: автоответ и запрос данных для брони
         if state is None:
             _send(chat, WELCOME_TEXT)
             _send(chat, BOOKING_REQUEST_TEXT)
-            _set_state(jid_key, State.WAITING_FOR_DATA)
+            _set_state(key, State.WAITING_FOR_DATA)
             log.info("Новый клиент %s, ожидаем данные", client_phone)
             return
 
         # После отправки заявки бот молчит, чтобы не мешать администратору
         if state is State.COMPLETED:
-            _touch(jid_key)
+            _set_state(key, State.COMPLETED)
             return
 
         # Клиент прислал данные заявки
         if state is State.WAITING_FOR_DATA:
             if not text:
                 _send(chat, NEED_TEXT_TEXT)
-                _touch(jid_key)
+                _set_state(key, State.WAITING_FOR_DATA)
                 return
 
             _send(chat, REQUEST_ACCEPTED_TEXT)
@@ -280,7 +364,7 @@ def on_message(_: NewClient, message: MessageEv) -> None:
             else:
                 log.warning("Заявка от %s НЕ переслана, требуется проверка", client_phone)
 
-            _set_state(jid_key, State.COMPLETED)
+            _set_state(key, State.COMPLETED)
 
     except Exception:
         log.exception("Необработанная ошибка при обработке сообщения от %s", client_phone)
@@ -304,8 +388,10 @@ class _WebHandler(BaseHTTPRequestHandler):
 
         if _connected:
             status = b"Bot is running and connected to WhatsApp"
-        else:
+        elif _qr_received:
             status = b"Bot is running. Not connected yet: open /qr to scan the code"
+        else:
+            status = b"Bot is running. Waiting for QR code from WhatsApp (check Render logs)"
         self._reply(200, status, "text/plain; charset=utf-8")
 
     def _reply(self, code: int, body: bytes, content_type: str) -> None:
@@ -325,12 +411,32 @@ def _run_web_server() -> None:
     server.serve_forever()
 
 
+def _backup_loop() -> None:
+    """Периодически сохраняет сессию WhatsApp в Firebase."""
+    while True:
+        time.sleep(SESSION_BACKUP_INTERVAL)
+        if _connected:
+            _backup_session()
+
+
+def _qr_watchdog() -> None:
+    """Если через QR_WATCHDOG_DELAY секунд QR не пришёл, пишет подсказку в лог."""
+    time.sleep(QR_WATCHDOG_DELAY)
+    if not _connected and not _qr_received:
+        log.warning(
+            "QR-код не получен за %d с. Проверьте строки «Событие QR получено» выше. "
+            "Если их нет, событие не вызывается.",
+            QR_WATCHDOG_DELAY,
+        )
+
+
 # ============================================================================
 # ЗАПУСК
 # ============================================================================
 
 if __name__ == "__main__":
-    threading.Thread(target=_cleanup_loop, daemon=True).start()
     threading.Thread(target=_run_web_server, daemon=True).start()
+    threading.Thread(target=_backup_loop, daemon=True).start()
+    threading.Thread(target=_qr_watchdog, daemon=True).start()
     log.info("Запуск бота. Для входа откройте /qr на адресе сервиса.")
     client.connect()  # блокирующий вызов, держит соединение
